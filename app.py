@@ -13,15 +13,20 @@ Run:
 
 import html
 import json
+import logging
 import os
 import re
 import tempfile
 import time
 
 import gradio as gr
+import openai
 import pymupdf
 from gtts import gTTS
 from openai import OpenAI
+
+log = logging.getLogger("summarizer")
+logging.basicConfig(level=logging.INFO)
 
 try:  # optional: load OPENROUTER_API_KEY from a local .env file
     from dotenv import load_dotenv
@@ -41,6 +46,9 @@ MODELS = [
 ]
 RETRIES_PER_MODEL = 2  # extra attempts after the first, with a short wait
 MAX_CHARS = 200_000  # safety cap on text sent to the model
+MAX_FILE_MB = 25  # reject bigger PDFs before parsing them
+MAX_PAGES = 150  # reject PDFs with more pages than this
+REQUEST_TIMEOUT_S = 90  # per model call, so a hung provider cannot block a worker
 
 SYSTEM_PROMPT = """You are an expert at reading scientific papers and summarizing them accurately.
 Return ONLY a valid JSON object (no markdown fences, no commentary) with exactly these keys:
@@ -64,11 +72,27 @@ Rules:
 
 # ---------- PDF + LLM ----------
 
+class UserFacingError(Exception):
+    """An error whose message is safe to show to the person using the app."""
+
+
 def extract_pdf(path: str) -> tuple[str, dict]:
-    doc = pymupdf.open(path)
-    text = "\n\n".join(page.get_text("text") for page in doc)
-    meta = doc.metadata or {}
-    doc.close()
+    if os.path.getsize(path) > MAX_FILE_MB * 1024 * 1024:
+        raise UserFacingError(f"That PDF is larger than {MAX_FILE_MB} MB. Please upload a smaller file.")
+    try:
+        doc = pymupdf.open(path)
+    except Exception as e:  # corrupt or not really a PDF
+        log.warning("Could not open PDF: %s", e)
+        raise UserFacingError("That file could not be read as a PDF.") from e
+    try:
+        if doc.needs_pass:
+            raise UserFacingError("That PDF is password-protected. Please upload an unlocked copy.")
+        if doc.page_count > MAX_PAGES:
+            raise UserFacingError(f"That PDF has more than {MAX_PAGES} pages. Please upload a shorter paper.")
+        text = "\n\n".join(page.get_text("text") for page in doc)
+        meta = doc.metadata or {}
+    finally:
+        doc.close()
     return text, meta
 
 
@@ -88,6 +112,8 @@ def llm_summarize(text: str, meta: dict) -> dict:
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=os.environ["OPENROUTER_API_KEY"],
+        timeout=REQUEST_TIMEOUT_S,
+        max_retries=0,  # we do our own retries below; the SDK default would multiply them
     )
     hint = ""
     if meta:
@@ -100,6 +126,15 @@ def llm_summarize(text: str, meta: dict) -> dict:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"{hint}PAPER TEXT:\n\n{text[:MAX_CHARS]}"},
     ]
+
+    # Worth retrying on the same model: busy/slow provider, or the model's output was unusable.
+    retryable = (
+        openai.RateLimitError,
+        openai.APITimeoutError,
+        openai.APIConnectionError,
+        openai.InternalServerError,
+        ValueError,  # includes json.JSONDecodeError and our empty/invalid-output checks
+    )
 
     last_error = None
     for model in MODELS:
@@ -114,12 +149,26 @@ def llm_summarize(text: str, meta: dict) -> dict:
                 content = response.choices[0].message.content
                 if not content:
                     raise ValueError("The model returned an empty response.")
-                return parse_json(content)
-            except Exception as e:  # noqa: BLE001
+                summary = parse_json(content)
+                if not isinstance(summary, dict):
+                    raise ValueError("The model did not return a JSON object.")
+                return summary
+            except openai.AuthenticationError as e:
+                # Wrong or revoked key: retrying or switching models cannot help.
+                log.error("OpenRouter rejected the API key: %s", e)
+                raise UserFacingError("The server's API key was rejected. The app owner needs to update it.") from e
+            except retryable as e:
                 last_error = e
+                log.warning("model=%s attempt=%d failed: %r", model, attempt + 1, e)
                 if attempt < RETRIES_PER_MODEL:
                     time.sleep(3 * (attempt + 1))  # 3s, then 6s
-    raise RuntimeError(f"All models failed. Last error: {last_error}")
+            except Exception as e:  # noqa: BLE001
+                # e.g. model removed (404), no credits (402), bad request (400): try the next model now.
+                last_error = e
+                log.warning("model=%s unusable, moving on: %r", model, e)
+                break
+    log.error("All models failed. Last error: %r", last_error)
+    raise UserFacingError("The summarizer is busy or unavailable right now. Please try again in a minute.")
 
 
 # ---------- Formatting ----------
@@ -318,7 +367,9 @@ FONTS = [
 
 def font_css(name: str) -> str:
     """Return a <style> block that loads a Google Font and applies it to the summary."""
-    if not name or name == "Default":
+    # Only allow names from our own list: the value is placed inside a <style> block,
+    # so an arbitrary string from the browser could inject CSS or markup.
+    if not name or name == "Default" or name not in FONTS:
         return ""
     family = name.replace(" ", "+")
     return (
@@ -336,28 +387,33 @@ def run(pdf_path, pasted_text):
         raise gr.Error("Set the OPENROUTER_API_KEY environment variable and restart the app.")
 
     text, meta = "", {}
-    if pdf_path:
-        text, meta = extract_pdf(pdf_path)
-    elif pasted_text and pasted_text.strip():
-        text = pasted_text
-    if not text.strip():
-        raise gr.Error("Upload a PDF (with selectable text) or paste the paper's text.")
-
     try:
+        if pdf_path:
+            text, meta = extract_pdf(pdf_path)
+        elif pasted_text and pasted_text.strip():
+            text = pasted_text[:MAX_CHARS]
+        if not text.strip():
+            raise UserFacingError("Upload a PDF (with selectable text) or paste the paper's text.")
         summary = llm_summarize(text, meta)
-    except Exception as e:  # noqa: BLE001
-        raise gr.Error(f"Summarization failed: {e}")
+    except UserFacingError as e:
+        raise gr.Error(str(e))
+    except Exception:  # noqa: BLE001
+        log.exception("Unexpected error while summarizing")
+        raise gr.Error("Something went wrong while summarizing. Please try again.")
 
     try:
         audio = make_audio(to_script(summary))
     except Exception as e:  # noqa: BLE001
-        gr.Warning(f"Audio generation failed ({e}); showing the text summary only.")
+        log.warning("Audio generation failed: %r", e)
+        gr.Warning("Audio generation failed; showing the text summary only.")
         audio = None
 
     return render_html(summary), audio, save_markdown(summary)
 
 
-with gr.Blocks(title="Paper Summarizer") as demo:
+# delete_cache=(check every N seconds, delete files older than N seconds): stops the
+# generated MP3/Markdown files from piling up on a small free container.
+with gr.Blocks(title="Paper Summarizer", delete_cache=(3600, 3600)) as demo:
     gr.HTML(HEADER)
     with gr.Row(equal_height=False):
         # Left: inputs and tools
@@ -379,4 +435,11 @@ with gr.Blocks(title="Paper Summarizer") as demo:
     font_dd.change(font_css, inputs=font_dd, outputs=font_html)
 
 if __name__ == "__main__":
-    demo.launch()
+    # Limit how many requests can wait in line, so a flood cannot pile up work (and API spend).
+    demo.queue(max_size=20, default_concurrency_limit=2)
+
+    # Optional password gate for a public deployment. Set APP_PASSWORD (and optionally
+    # APP_USER) as environment variables; leave unset for an open app.
+    password = os.environ.get("APP_PASSWORD")
+    auth = (os.environ.get("APP_USER", "user"), password) if password else None
+    demo.launch(auth=auth)
